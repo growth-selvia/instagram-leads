@@ -1,19 +1,14 @@
 """
-Selvia — Instagram Lead Scraper API
-====================================
-Microserviço que coleta comentaristas de perfis de comissões de formatura
-e filtra leads com perfil de estudante de medicina.
-
-Uso: O n8n Cloud chama essa API via HTTP Request.
+Selvia — Instagram Lead Scraper API (v2 — Async + Webhook)
+===========================================================
+Versão atualizada que processa a coleta em background
+e envia os resultados via webhook para o n8n.
 
 Requisitos:
-    pip install flask instaloader gunicorn
-
-Execução (desenvolvimento):
-    python app.py
+    pip install flask instaloader gunicorn requests
 
 Execução (produção):
-    gunicorn app:app --bind 0.0.0.0:5000 --workers 2 --timeout 300
+    gunicorn app:app --bind 0.0.0.0:5000 --workers 2 --timeout 60
 """
 
 import instaloader
@@ -22,9 +17,10 @@ import json
 import time
 import random
 import logging
+import threading
+import requests as http_requests
 from datetime import datetime
 from flask import Flask, request, jsonify
-from collections import Counter
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -35,7 +31,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # Palavras-chave que indicam perfil de medicina/universitário
-# (case-insensitive, aplicadas na bio do usuário)
 KEYWORDS_MEDICINA = [
     "medicina", "med", "medica", "médica", "médico", "medico",
     "medicine", "medical", "med student", "estudante de medicina",
@@ -43,19 +38,19 @@ KEYWORDS_MEDICINA = [
     "futuro médico", "futura médica", "futuro medico", "futura medica",
     "interno", "interna", "internato",
     "residência", "residencia",
-    "⚕️", "🩺", "🏥", "💉", "🥼",  # emojis comuns de medicina
+    "⚕️", "🩺", "🏥", "💉", "🥼",
 ]
 
-# Padrões regex para variações como "MED 28", "MED28", "MED2028", "turma med"
+# Padrões regex para variações como "MED 28", "MED28", "MED2028"
 REGEX_MEDICINA = [
-    r"\bmed\s?\d{2,4}\b",        # med 28, med2028, med28
-    r"\bmedicina\s?\d{2,4}\b",   # medicina 28, medicina2028
-    r"\bturma\s+med",            # turma med...
-    r"\b\d{2,4}\s*med\b",        # 28med, 2028 med
+    r"\bmed\s?\d{2,4}\b",
+    r"\bmedicina\s?\d{2,4}\b",
+    r"\bturma\s+med",
+    r"\b\d{2,4}\s*med\b",
 ]
 
-# Token de segurança simples (defina no .env ou variável de ambiente)
-API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"  # ⚠️ TROQUE ISSO!
+# Token de segurança — TROQUE ISSO!
+API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"
 
 
 # ============================================================
@@ -63,39 +58,24 @@ API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"  # ⚠️ TROQUE ISSO!
 # ============================================================
 
 def check_auth(req):
-    """Verifica o token de autenticação."""
     token = req.headers.get("Authorization", "").replace("Bearer ", "")
     return token == API_TOKEN
 
 
 def bio_matches_medicina(bio: str) -> bool:
-    """
-    Verifica se a bio contém indicadores de estudante de medicina.
-    Retorna True se encontrar match.
-    """
     if not bio:
         return False
     bio_lower = bio.lower()
-
-    # Checa palavras-chave diretas
     for kw in KEYWORDS_MEDICINA:
         if kw.lower() in bio_lower:
             return True
-
-    # Checa padrões regex
     for pattern in REGEX_MEDICINA:
         if re.search(pattern, bio_lower):
             return True
-
     return False
 
 
-def get_profile_info(loader: instaloader.Instaloader, username: str) -> dict:
-    """
-    Busca informações básicas do perfil.
-    Retorna dict com bio, nome, is_private, etc.
-    Retorna None se não conseguir acessar.
-    """
+def get_profile_info(loader, username):
     try:
         profile = instaloader.Profile.from_username(loader.context, username)
         return {
@@ -104,90 +84,44 @@ def get_profile_info(loader: instaloader.Instaloader, username: str) -> dict:
             "bio": profile.biography or "",
             "is_private": profile.is_private,
             "followers": profile.followers,
-            "following": profile.followees,
-            "profile_pic_url": profile.profile_pic_url,
         }
     except Exception as e:
         logger.warning(f"Não conseguiu acessar perfil @{username}: {e}")
         return None
 
 
-def scrape_commenters(
-    loader: instaloader.Instaloader,
-    target_username: str,
-    max_posts: int = 0,
-    delay_between_posts: tuple = (3, 8),
-) -> dict:
-    """
-    Coleta todos os comentaristas de um perfil público do Instagram.
-
-    Args:
-        loader: instância do Instaloader
-        target_username: @ da comissão de formatura
-        max_posts: 0 = todos os posts disponíveis
-        delay_between_posts: range de delay aleatório entre posts (seg)
-
-    Returns:
-        dict com:
-            - commenters: {username: {"count": N, "comments": [...]}}
-            - posts_analyzed: int
-            - total_comments: int
-    """
-    try:
-        profile = instaloader.Profile.from_username(loader.context, target_username)
-    except Exception as e:
-        logger.error(f"Erro ao acessar perfil @{target_username}: {e}")
-        raise ValueError(f"Não foi possível acessar o perfil @{target_username}. Verifique se existe e é público.")
+def scrape_commenters(loader, target_username, max_posts=0):
+    profile = instaloader.Profile.from_username(loader.context, target_username)
 
     if profile.is_private:
-        raise ValueError(f"O perfil @{target_username} é privado. Só é possível coletar de perfis públicos.")
+        raise ValueError(f"O perfil @{target_username} é privado.")
 
     commenters = {}
     posts_analyzed = 0
     total_comments = 0
 
-    logger.info(f"Iniciando coleta de @{target_username} ({profile.mediacount} posts)")
+    logger.info(f"Coletando @{target_username} ({profile.mediacount} posts)")
 
     for post in profile.get_posts():
         if max_posts > 0 and posts_analyzed >= max_posts:
             break
 
         posts_analyzed += 1
-        post_comments = 0
-
-        logger.info(f"  Post {posts_analyzed}: {post.shortcode} ({post.date_utc.strftime('%Y-%m-%d')})")
+        logger.info(f"  Post {posts_analyzed}: {post.shortcode}")
 
         try:
             for comment in post.get_comments():
                 commenter = comment.owner.username
-                text = comment.text or ""
-                post_comments += 1
                 total_comments += 1
 
                 if commenter not in commenters:
-                    commenters[commenter] = {
-                        "count": 0,
-                        "comments": [],
-                    }
-
+                    commenters[commenter] = {"count": 0}
                 commenters[commenter]["count"] += 1
-                commenters[commenter]["comments"].append({
-                    "text": text[:200],  # trunca pra não ficar gigante
-                    "post_shortcode": post.shortcode,
-                    "date": comment.created_at_utc.isoformat() if comment.created_at_utc else None,
-                })
-
-            logger.info(f"    → {post_comments} comentários coletados")
 
         except Exception as e:
-            logger.warning(f"    → Erro ao coletar comentários do post {post.shortcode}: {e}")
+            logger.warning(f"  Erro no post {post.shortcode}: {e}")
 
-        # Delay entre posts para não ser bloqueado
-        delay = random.uniform(*delay_between_posts)
-        logger.info(f"    → Aguardando {delay:.1f}s...")
-        time.sleep(delay)
-
-    logger.info(f"Coleta finalizada: {posts_analyzed} posts, {total_comments} comentários, {len(commenters)} usuários únicos")
+        time.sleep(random.uniform(3, 8))
 
     return {
         "commenters": commenters,
@@ -196,185 +130,99 @@ def scrape_commenters(
     }
 
 
-def enrich_and_filter_leads(
-    loader: instaloader.Instaloader,
-    commenters: dict,
-    min_comments: int = 1,
-    check_bio: bool = True,
-    delay_between_profiles: tuple = (2, 5),
-) -> list:
-    """
-    Enriquece os dados dos comentaristas verificando suas bios
-    e filtra os que têm perfil de estudante de medicina.
-
-    Args:
-        loader: instância do Instaloader
-        commenters: dict retornado por scrape_commenters
-        min_comments: mínimo de comentários para considerar o lead
-        check_bio: se True, verifica a bio do perfil
-        delay_between_profiles: delay entre checagens de perfil
-
-    Returns:
-        Lista de leads filtrados e enriquecidos
-    """
+def enrich_and_filter_leads(loader, commenters, min_comments=1, check_bio=True):
     leads = []
-    checked = 0
-    matched = 0
-
-    # Ordena por quantidade de comentários (mais engajados primeiro)
     sorted_commenters = sorted(
         commenters.items(),
         key=lambda x: x[1]["count"],
         reverse=True,
     )
 
-    logger.info(f"Filtrando {len(sorted_commenters)} comentaristas (min_comments={min_comments}, check_bio={check_bio})")
-
     for username, data in sorted_commenters:
-        # Filtro por quantidade mínima de comentários
         if data["count"] < min_comments:
             continue
 
         lead = {
             "username": username,
-            "nome": username,  # fallback
+            "nome": username,
             "bio": "",
             "is_private": None,
             "followers": None,
             "total_comentarios": data["count"],
             "bio_match_medicina": False,
             "status": "pendente",
-            "versao_msg": chr(65 + (len(leads) % 6)),  # A, B, C, D, E, F rotativo
+            "versao_msg": chr(65 + (len(leads) % 6)),
             "data_envio": "",
             "coletado_em": datetime.utcnow().isoformat(),
         }
 
-        # Enriquecer com dados do perfil
         if check_bio:
-            checked += 1
-            profile_info = get_profile_info(loader, username)
-
-            if profile_info:
-                lead["nome"] = profile_info["nome"]
-                lead["bio"] = profile_info["bio"]
-                lead["is_private"] = profile_info["is_private"]
-                lead["followers"] = profile_info["followers"]
-                lead["bio_match_medicina"] = bio_matches_medicina(profile_info["bio"])
-
-                if lead["bio_match_medicina"]:
-                    matched += 1
-
-            # Delay entre perfis
-            delay = random.uniform(*delay_between_profiles)
-            time.sleep(delay)
-
-            # Log de progresso a cada 10 perfis
-            if checked % 10 == 0:
-                logger.info(f"  Verificados {checked} perfis, {matched} matches até agora...")
+            info = get_profile_info(loader, username)
+            if info:
+                lead["nome"] = info["nome"]
+                lead["bio"] = info["bio"]
+                lead["is_private"] = info["is_private"]
+                lead["followers"] = info["followers"]
+                lead["bio_match_medicina"] = bio_matches_medicina(info["bio"])
+            time.sleep(random.uniform(2, 5))
 
         leads.append(lead)
-
-    logger.info(f"Filtragem concluída: {checked} perfis verificados, {matched} matches de medicina")
 
     return leads
 
 
 # ============================================================
-# ENDPOINTS DA API
+# PROCESSAMENTO EM BACKGROUND
 # ============================================================
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check."""
-    return jsonify({"status": "ok", "service": "selvia-instagram-scraper"})
-
-
-@app.route("/scrape", methods=["POST"])
-def scrape():
+def run_scrape_job(params):
     """
-    Endpoint principal: coleta leads de um perfil de comissão.
-
-    Body (JSON):
-    {
-        "target_username": "comissao_med28",
-        "max_posts": 0,               // 0 = todos
-        "min_comments": 1,             // mínimo de comentários
-        "check_bio": true,             // verificar bio de cada comentarista
-        "only_medicina": false,        // retornar APENAS matches de medicina
-        "instagram_login": "",         // (opcional) login do Instagram
-        "instagram_password": ""       // (opcional) senha do Instagram
-    }
-
-    Nota sobre login:
-        - Sem login: funciona para perfis públicos, mas tem rate limit mais agressivo
-        - Com login: acessa mais dados, mas arrisca a conta se abusar
-        - Recomendação: use sem login primeiro; só use login se necessário
+    Executa a coleta em background e envia o resultado
+    para o webhook do n8n quando terminar.
     """
-    # Autenticação da API
-    if not check_auth(request):
-        return jsonify({"error": "Token inválido"}), 401
+    target = params["target_username"]
+    webhook_url = params["webhook_url"]
+    max_posts = params.get("max_posts", 0)
+    min_comments = params.get("min_comments", 1)
+    check_bio = params.get("check_bio", True)
+    only_medicina = params.get("only_medicina", False)
 
-    # Parse do body
-    body = request.get_json()
-    if not body or "target_username" not in body:
-        return jsonify({"error": "Campo 'target_username' é obrigatório"}), 400
+    logger.info(f"[JOB] Iniciando coleta de @{target}")
 
-    target = body["target_username"].strip().lstrip("@")
-    max_posts = body.get("max_posts", 0)
-    min_comments = body.get("min_comments", 1)
-    check_bio = body.get("check_bio", True)
-    only_medicina = body.get("only_medicina", False)
-    ig_login = body.get("instagram_login", "")
-    ig_password = body.get("instagram_password", "")
-
-    logger.info(f"Requisição recebida: target=@{target}, max_posts={max_posts}, check_bio={check_bio}")
-
-    # Inicializar Instaloader
     loader = instaloader.Instaloader(
         download_pictures=False,
         download_videos=False,
         download_video_thumbnails=False,
         download_geotags=False,
-        download_comments=False,  # usamos get_comments() manualmente
+        download_comments=False,
         save_metadata=False,
         compress_json=False,
         quiet=True,
     )
 
     # Login opcional
+    ig_login = params.get("instagram_login", "")
+    ig_password = params.get("instagram_password", "")
     if ig_login and ig_password:
         try:
             loader.login(ig_login, ig_password)
-            logger.info("Login no Instagram realizado com sucesso")
         except Exception as e:
-            logger.warning(f"Falha no login: {e}. Continuando sem autenticação.")
+            logger.warning(f"[JOB] Falha no login: {e}")
 
     try:
         # Etapa 1: Coletar comentaristas
-        result = scrape_commenters(
-            loader=loader,
-            target_username=target,
-            max_posts=max_posts,
-            delay_between_posts=(3, 8),
-        )
+        result = scrape_commenters(loader, target, max_posts)
 
         # Etapa 2: Enriquecer e filtrar
         leads = enrich_and_filter_leads(
-            loader=loader,
-            commenters=result["commenters"],
-            min_comments=min_comments,
-            check_bio=check_bio,
-            delay_between_profiles=(2, 5),
+            loader, result["commenters"], min_comments, check_bio
         )
 
-        # Filtrar apenas medicina se solicitado
         if only_medicina:
             leads = [l for l in leads if l["bio_match_medicina"]]
 
-        # Ordenar: matches de medicina primeiro, depois por engajamento
         leads.sort(key=lambda x: (-int(x["bio_match_medicina"]), -x["total_comentarios"]))
 
-        # Estatísticas
         stats = {
             "target_username": target,
             "posts_analyzed": result["posts_analyzed"],
@@ -385,29 +233,92 @@ def scrape():
             "collected_at": datetime.utcnow().isoformat(),
         }
 
-        logger.info(f"Resultado: {stats}")
-
-        return jsonify({
+        payload = {
             "success": True,
             "stats": stats,
             "leads": leads,
-        })
+        }
 
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+        logger.info(f"[JOB] Coleta concluída: {stats['leads_returned']} leads. Enviando para webhook...")
+
     except Exception as e:
-        logger.exception("Erro inesperado durante scraping")
-        return jsonify({"success": False, "error": f"Erro interno: {str(e)}"}), 500
+        logger.exception(f"[JOB] Erro na coleta de @{target}")
+        payload = {
+            "success": False,
+            "error": str(e),
+            "target_username": target,
+        }
+
+    # Enviar resultado para o webhook do n8n
+    try:
+        resp = http_requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        logger.info(f"[JOB] Webhook respondeu: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"[JOB] Falha ao enviar para webhook: {e}")
+
+
+# ============================================================
+# ENDPOINTS
+# ============================================================
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "selvia-instagram-scraper", "version": "2.0"})
+
+
+@app.route("/scrape", methods=["POST"])
+def scrape():
+    """
+    Inicia a coleta em background e retorna imediatamente.
+
+    Body (JSON):
+    {
+        "target_username": "comissao_med28",
+        "webhook_url": "https://SEU-N8N.app.n8n.cloud/webhook/selvia-leads",
+        "max_posts": 0,
+        "min_comments": 1,
+        "check_bio": true,
+        "only_medicina": false,
+        "instagram_login": "",
+        "instagram_password": ""
+    }
+
+    Responde imediatamente com {"status": "processing"}.
+    Quando a coleta terminar, envia o resultado para o webhook_url.
+    """
+    if not check_auth(request):
+        return jsonify({"error": "Token inválido"}), 401
+
+    body = request.get_json()
+    if not body:
+        return jsonify({"error": "Body JSON é obrigatório"}), 400
+    if "target_username" not in body:
+        return jsonify({"error": "Campo 'target_username' é obrigatório"}), 400
+    if "webhook_url" not in body:
+        return jsonify({"error": "Campo 'webhook_url' é obrigatório"}), 400
+
+    body["target_username"] = body["target_username"].strip().lstrip("@")
+
+    # Inicia a coleta em uma thread separada
+    thread = threading.Thread(target=run_scrape_job, args=(body,), daemon=True)
+    thread.start()
+
+    logger.info(f"Coleta de @{body['target_username']} iniciada em background")
+
+    return jsonify({
+        "status": "processing",
+        "message": f"Coleta de @{body['target_username']} iniciada. O resultado será enviado para {body['webhook_url']}",
+        "target_username": body["target_username"],
+    })
 
 
 @app.route("/check-profile", methods=["POST"])
 def check_profile():
-    """
-    Endpoint auxiliar: verifica se um perfil específico é de medicina.
-    Útil para validação manual.
-
-    Body: { "username": "joao_med28" }
-    """
     if not check_auth(request):
         return jsonify({"error": "Token inválido"}), 401
 
@@ -417,13 +328,9 @@ def check_profile():
         return jsonify({"error": "Campo 'username' é obrigatório"}), 400
 
     loader = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        quiet=True,
+        download_pictures=False, download_videos=False,
+        download_video_thumbnails=False, download_geotags=False,
+        download_comments=False, save_metadata=False, quiet=True,
     )
 
     info = get_profile_info(loader, username)
@@ -431,13 +338,8 @@ def check_profile():
         return jsonify({"error": f"Perfil @{username} não encontrado"}), 404
 
     info["bio_match_medicina"] = bio_matches_medicina(info["bio"])
-
     return jsonify({"success": True, "profile": info})
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
