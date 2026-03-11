@@ -1,7 +1,19 @@
 """
-Selvia — Instagram Lead Scraper API (v3 — Debug + Webhook Fix)
-===============================================================
-Versão com logs detalhados e endpoint de diagnóstico.
+Selvia — Instagram Lead Scraper API (v4 — Login por Sessão)
+=============================================================
+Usa arquivo de sessão do Instaloader para autenticação.
+Resolve problemas de 2FA, challenge e rate limit.
+
+SETUP:
+    1. No seu Mac, rode:
+         pip3 install instaloader
+         instaloader --login SEU_USUARIO
+    2. Copie o arquivo de sessão:
+         cat ~/.config/instaloader/session-SEU_USUARIO | base64
+    3. No Render, crie a variável de ambiente:
+         INSTAGRAM_SESSION = (cole o base64 aqui)
+         INSTAGRAM_USERNAME = SEU_USUARIO
+    4. Deploy!
 
 Requisitos:
     pip install flask instaloader gunicorn requests
@@ -12,24 +24,26 @@ Execução:
 
 import instaloader
 import re
+import os
 import json
 import sys
 import time
 import random
+import base64
 import logging
 import threading
 import traceback
 import requests as http_requests
 from datetime import datetime
+from pathlib import Path
 from flask import Flask, request, jsonify
 
 # ============================================================
-# CONFIGURAÇÃO — Logs forçam flush para aparecer no Render
+# CONFIGURAÇÃO
 # ============================================================
 
 app = Flask(__name__)
 
-# Força logs a aparecerem imediatamente (sem buffer)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,9 +51,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Força flush em todo print também
 import functools
 print = functools.partial(print, flush=True)
+
+# Variáveis de ambiente
+API_TOKEN = os.environ.get("API_TOKEN", "SELVIA_API_TOKEN_AQUI")
+INSTAGRAM_USERNAME = os.environ.get("INSTAGRAM_USERNAME", "")
+INSTAGRAM_SESSION_B64 = os.environ.get("INSTAGRAM_SESSION", "")
+
+# Diretório para salvar a sessão no container
+SESSION_DIR = Path("/tmp/instaloader-session")
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 KEYWORDS_MEDICINA = [
     "medicina", "med", "medica", "médica", "médico", "medico",
@@ -58,7 +80,84 @@ REGEX_MEDICINA = [
     r"\b\d{2,4}\s*med\b",
 ]
 
-API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"  # ⚠️ TROQUE!
+
+# ============================================================
+# SESSÃO DO INSTAGRAM
+# ============================================================
+
+def setup_session_file():
+    """
+    Decodifica a sessão base64 da variável de ambiente
+    e salva como arquivo no container.
+    """
+    if not INSTAGRAM_SESSION_B64 or not INSTAGRAM_USERNAME:
+        logger.warning("[SESSION] ⚠️ INSTAGRAM_SESSION ou INSTAGRAM_USERNAME não configurados!")
+        logger.warning("[SESSION] O scraper vai rodar SEM login (rate limit agressivo)")
+        sys.stdout.flush()
+        return None
+
+    session_path = SESSION_DIR / f"session-{INSTAGRAM_USERNAME}"
+
+    try:
+        session_data = base64.b64decode(INSTAGRAM_SESSION_B64)
+        session_path.write_bytes(session_data)
+        logger.info(f"[SESSION] ✅ Arquivo de sessão salvo: {session_path}")
+        logger.info(f"[SESSION] ✅ Usuário: @{INSTAGRAM_USERNAME}")
+        sys.stdout.flush()
+        return str(session_path)
+    except Exception as e:
+        logger.error(f"[SESSION] ❌ Erro ao decodificar sessão: {e}")
+        sys.stdout.flush()
+        return None
+
+
+def create_loader_with_session():
+    """
+    Cria uma instância do Instaloader autenticada via sessão.
+    Retorna (loader, logged_in: bool)
+    """
+    loader = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+        quiet=True,
+    )
+
+    if not INSTAGRAM_USERNAME or not INSTAGRAM_SESSION_B64:
+        logger.info("[LOADER] Sem credenciais — rodando sem login")
+        sys.stdout.flush()
+        return loader, False
+
+    try:
+        # Carrega a sessão do arquivo
+        session_path = SESSION_DIR / f"session-{INSTAGRAM_USERNAME}"
+
+        if not session_path.exists():
+            setup_session_file()
+
+        loader.load_session_from_file(INSTAGRAM_USERNAME, str(session_path))
+
+        # Testa se a sessão é válida
+        test_profile = instaloader.Profile.from_username(loader.context, INSTAGRAM_USERNAME)
+        logger.info(f"[LOADER] ✅ Login OK via sessão! Logado como @{test_profile.username}")
+        sys.stdout.flush()
+        return loader, True
+
+    except instaloader.exceptions.LoginException as e:
+        logger.error(f"[LOADER] ❌ Sessão expirada ou inválida: {e}")
+        logger.error(f"[LOADER] Gere uma nova sessão no seu Mac com: instaloader --login {INSTAGRAM_USERNAME}")
+        sys.stdout.flush()
+        return loader, False
+
+    except Exception as e:
+        logger.error(f"[LOADER] ❌ Erro ao carregar sessão: {e}")
+        logger.error(f"[LOADER] Traceback:\n{traceback.format_exc()}")
+        sys.stdout.flush()
+        return loader, False
 
 
 # ============================================================
@@ -125,11 +224,11 @@ def scrape_commenters(loader, target_username, max_posts=0):
         except Exception as e:
             logger.warning(f"  Erro no post {post.shortcode}: {e}")
 
-        logger.info(f"  Post {posts_analyzed}/{profile.mediacount}: {post.shortcode} — {total_comments} comentários até agora")
+        logger.info(f"  Post {posts_analyzed}/{profile.mediacount}: {post.shortcode} — {total_comments} comentários")
         sys.stdout.flush()
         time.sleep(random.uniform(3, 8))
 
-    logger.info(f"Coleta finalizada: {posts_analyzed} posts, {total_comments} comentários, {len(commenters)} únicos")
+    logger.info(f"Coleta OK: {posts_analyzed} posts, {total_comments} comentários, {len(commenters)} únicos")
     sys.stdout.flush()
     return {
         "commenters": commenters,
@@ -169,24 +268,19 @@ def enrich_and_filter_leads(loader, commenters, min_comments=1, check_bio=True):
             time.sleep(random.uniform(2, 5))
         leads.append(lead)
 
-    logger.info(f"Leads processados: {len(leads)} total, {sum(1 for l in leads if l['bio_match_medicina'])} medicina")
+    logger.info(f"Leads: {len(leads)} total, {sum(1 for l in leads if l['bio_match_medicina'])} medicina")
     sys.stdout.flush()
     return leads
 
 
 # ============================================================
-# ENVIO PARA WEBHOOK — COM RETRY E LOGS DETALHADOS
+# ENVIO PARA WEBHOOK
 # ============================================================
 
 def send_to_webhook(webhook_url, payload):
-    """
-    Envia o payload para o webhook do n8n.
-    Tenta até 3 vezes em caso de falha.
-    """
     logger.info(f"[WEBHOOK] ==========================================")
     logger.info(f"[WEBHOOK] URL: {webhook_url}")
     logger.info(f"[WEBHOOK] Leads: {len(payload.get('leads', []))}")
-    logger.info(f"[WEBHOOK] Success: {payload.get('success')}")
     sys.stdout.flush()
 
     for attempt in range(1, 4):
@@ -207,26 +301,13 @@ def send_to_webhook(webhook_url, payload):
 
             if resp.status_code == 200:
                 return True
-            else:
-                logger.warning(f"[WEBHOOK] ⚠️ Status inesperado: {resp.status_code}")
-                sys.stdout.flush()
 
-        except http_requests.exceptions.ConnectionError as e:
-            logger.error(f"[WEBHOOK] ❌ CONEXÃO FALHOU (tentativa {attempt}): {e}")
-            sys.stdout.flush()
-        except http_requests.exceptions.Timeout as e:
-            logger.error(f"[WEBHOOK] ❌ TIMEOUT (tentativa {attempt}): {e}")
-            sys.stdout.flush()
         except Exception as e:
-            logger.error(f"[WEBHOOK] ❌ ERRO (tentativa {attempt}): {e}")
-            logger.error(f"[WEBHOOK] Traceback:\n{traceback.format_exc()}")
+            logger.error(f"[WEBHOOK] ❌ Erro (tentativa {attempt}): {e}")
             sys.stdout.flush()
 
         if attempt < 3:
-            wait = attempt * 5
-            logger.info(f"[WEBHOOK] Aguardando {wait}s...")
-            sys.stdout.flush()
-            time.sleep(wait)
+            time.sleep(attempt * 5)
 
     logger.error(f"[WEBHOOK] ❌❌❌ FALHA TOTAL após 3 tentativas")
     sys.stdout.flush()
@@ -245,32 +326,15 @@ def run_scrape_job(params):
     check_bio = params.get("check_bio", True)
     only_medicina = params.get("only_medicina", False)
 
-    logger.info(f"[JOB] ========== INÍCIO DA COLETA ==========")
+    logger.info(f"[JOB] ========== INÍCIO ==========")
     logger.info(f"[JOB] Target: @{target}")
     logger.info(f"[JOB] Webhook: {webhook_url}")
-    logger.info(f"[JOB] Config: max_posts={max_posts}, min_comments={min_comments}, check_bio={check_bio}")
     sys.stdout.flush()
 
-    loader = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False,
-        quiet=True,
-    )
-
-    ig_login = params.get("instagram_login", "")
-    ig_password = params.get("instagram_password", "")
-    if ig_login and ig_password:
-        try:
-            loader.login(ig_login, ig_password)
-            logger.info("[JOB] Login OK")
-        except Exception as e:
-            logger.warning(f"[JOB] Login falhou: {e}")
-        sys.stdout.flush()
+    # Criar loader com sessão
+    loader, logged_in = create_loader_with_session()
+    logger.info(f"[JOB] Login: {'✅ autenticado' if logged_in else '⚠️ sem login (rate limit baixo)'}")
+    sys.stdout.flush()
 
     try:
         result = scrape_commenters(loader, target, max_posts)
@@ -287,26 +351,21 @@ def run_scrape_job(params):
             "unique_commenters": len(result["commenters"]),
             "leads_returned": len(leads),
             "leads_medicina": sum(1 for l in leads if l["bio_match_medicina"]),
+            "logged_in": logged_in,
             "collected_at": datetime.utcnow().isoformat(),
         }
         payload = {"success": True, "stats": stats, "leads": leads}
-
-        logger.info(f"[JOB] ✅ Coleta OK: {stats['leads_returned']} leads, {stats['leads_medicina']} medicina")
+        logger.info(f"[JOB] ✅ Coleta OK: {json.dumps(stats, indent=2)}")
         sys.stdout.flush()
 
     except Exception as e:
-        logger.error(f"[JOB] ❌ Erro na coleta: {e}")
+        logger.error(f"[JOB] ❌ Erro: {e}")
         logger.error(f"[JOB] Traceback:\n{traceback.format_exc()}")
         sys.stdout.flush()
         payload = {"success": False, "error": str(e), "target_username": target}
 
-    # Enviar para webhook
     success = send_to_webhook(webhook_url, payload)
-
-    if success:
-        logger.info(f"[JOB] ========== FIM — SUCESSO ==========")
-    else:
-        logger.error(f"[JOB] ========== FIM — WEBHOOK FALHOU ==========")
+    logger.info(f"[JOB] ========== FIM — {'SUCESSO' if success else 'WEBHOOK FALHOU'} ==========")
     sys.stdout.flush()
 
 
@@ -316,18 +375,48 @@ def run_scrape_job(params):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "selvia-scraper", "version": "3.0"})
+    """Health check com status da sessão."""
+    session_ok = bool(INSTAGRAM_USERNAME and INSTAGRAM_SESSION_B64)
+    return jsonify({
+        "status": "ok",
+        "service": "selvia-scraper",
+        "version": "4.0",
+        "instagram_session": "configurada" if session_ok else "NÃO configurada",
+        "instagram_user": INSTAGRAM_USERNAME or "nenhum",
+    })
+
+
+@app.route("/check-session", methods=["GET"])
+def check_session():
+    """
+    🔧 DIAGNÓSTICO: Verifica se a sessão do Instagram está válida.
+    Tenta fazer login e acessar o perfil.
+    """
+    if not INSTAGRAM_USERNAME or not INSTAGRAM_SESSION_B64:
+        return jsonify({
+            "success": False,
+            "error": "Variáveis INSTAGRAM_USERNAME e/ou INSTAGRAM_SESSION não configuradas no Render",
+            "help": "Vá em Render → Environment → adicione INSTAGRAM_USERNAME e INSTAGRAM_SESSION",
+        }), 400
+
+    loader, logged_in = create_loader_with_session()
+
+    if logged_in:
+        return jsonify({
+            "success": True,
+            "message": f"✅ Sessão válida! Logado como @{INSTAGRAM_USERNAME}",
+            "username": INSTAGRAM_USERNAME,
+        })
+    else:
+        return jsonify({
+            "success": False,
+            "message": "❌ Sessão inválida ou expirada",
+            "help": f"Gere nova sessão: instaloader --login {INSTAGRAM_USERNAME} && cat ~/.config/instaloader/session-{INSTAGRAM_USERNAME} | base64",
+        }), 401
 
 
 @app.route("/test-webhook", methods=["POST"])
 def test_webhook():
-    """
-    🔧 DIAGNÓSTICO: Testa se o Render consegue chamar o webhook do n8n.
-
-    Body: { "webhook_url": "https://growthselvia.app.n8n.cloud/webhook/selvia-leads" }
-
-    Envia um lead fake. Se aparecer na planilha, o webhook funciona.
-    """
     body = request.get_json()
     webhook_url = body.get("webhook_url", "")
     if not webhook_url:
@@ -344,63 +433,39 @@ def test_webhook():
             "leads_medicina": 1,
             "collected_at": datetime.utcnow().isoformat(),
         },
-        "leads": [
-            {
-                "username": "teste_webhook_ok",
-                "nome": "TESTE - Webhook Funcionando!",
-                "bio": "Se apareceu na planilha, o webhook funciona perfeitamente.",
-                "is_private": False,
-                "followers": 0,
-                "total_comentarios": 0,
-                "bio_match_medicina": True,
-                "status": "teste",
-                "versao_msg": "A",
-                "data_envio": "",
-                "coletado_em": datetime.utcnow().isoformat(),
-            }
-        ],
+        "leads": [{
+            "username": "teste_webhook_ok",
+            "nome": "TESTE - Webhook Funcionando!",
+            "bio": "Se apareceu na planilha, o webhook funciona.",
+            "is_private": False,
+            "followers": 0,
+            "total_comentarios": 0,
+            "bio_match_medicina": True,
+            "status": "teste",
+            "versao_msg": "A",
+            "data_envio": "",
+            "coletado_em": datetime.utcnow().isoformat(),
+        }],
     }
 
-    logger.info(f"[TEST-WEBHOOK] Testando: {webhook_url}")
-    sys.stdout.flush()
-
     try:
-        resp = http_requests.post(
-            webhook_url,
-            json=test_payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        result = {
-            "webhook_url": webhook_url,
+        resp = http_requests.post(webhook_url, json=test_payload,
+                                   headers={"Content-Type": "application/json"}, timeout=30)
+        return jsonify({
+            "success": resp.status_code == 200,
             "status_code": resp.status_code,
             "response_body": resp.text[:500],
-            "success": resp.status_code == 200,
-            "message": "✅ Webhook alcançável! Verifique se o lead 'teste_webhook_ok' apareceu na planilha." if resp.status_code == 200 else f"⚠️ Webhook respondeu com status {resp.status_code}",
-        }
-        logger.info(f"[TEST-WEBHOOK] Resultado: {json.dumps(result)}")
-        sys.stdout.flush()
-        return jsonify(result)
-
+        })
     except Exception as e:
-        error_result = {
-            "webhook_url": webhook_url,
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "message": "❌ Não conseguiu alcançar o webhook. Verifique se o Fluxo 2 está ATIVO no n8n.",
-        }
-        logger.error(f"[TEST-WEBHOOK] Erro: {json.dumps(error_result)}")
-        sys.stdout.flush()
-        return jsonify(error_result), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
     """
-    Inicia coleta em background. Responde imediatamente.
+    Inicia coleta em background.
 
-    Body (JSON):
+    Body:
     {
         "target_username": "comissao_med28",
         "webhook_url": "https://growthselvia.app.n8n.cloud/webhook/selvia-leads",
@@ -409,6 +474,8 @@ def scrape():
         "check_bio": true,
         "only_medicina": false
     }
+
+    Não precisa mais de instagram_login/password — usa a sessão do ambiente.
     """
     if not check_auth(request):
         return jsonify({"error": "Token inválido"}), 401
@@ -429,14 +496,12 @@ def scrape():
     thread = threading.Thread(target=run_scrape_job, args=(body,), daemon=True)
     thread.start()
 
-    logger.info(f"[API] Thread iniciada para @{body['target_username']}")
-    sys.stdout.flush()
-
     return jsonify({
         "status": "processing",
-        "message": f"Coleta de @{body['target_username']} iniciada. Resultado será enviado para o webhook.",
+        "message": f"Coleta de @{body['target_username']} iniciada.",
         "target_username": body["target_username"],
         "webhook_url": body["webhook_url"],
+        "session_configured": bool(INSTAGRAM_USERNAME),
     })
 
 
@@ -449,11 +514,7 @@ def check_profile():
     if not username:
         return jsonify({"error": "Campo 'username' obrigatório"}), 400
 
-    loader = instaloader.Instaloader(
-        download_pictures=False, download_videos=False,
-        download_video_thumbnails=False, download_geotags=False,
-        download_comments=False, save_metadata=False, quiet=True,
-    )
+    loader, _ = create_loader_with_session()
     info = get_profile_info(loader, username)
     if not info:
         return jsonify({"error": f"@{username} não encontrado"}), 404
@@ -461,7 +522,15 @@ def check_profile():
     return jsonify({"success": True, "profile": info})
 
 
+# ============================================================
+# STARTUP
+# ============================================================
+
+# Preparar sessão ao iniciar o servidor
+logger.info("🚀 Selvia Scraper v4 iniciando...")
+setup_session_file()
+sys.stdout.flush()
+
 if __name__ == "__main__":
-    print("🚀 Selvia Scraper v3 iniciando...")
     app.run(host="0.0.0.0", port=5000, debug=True)
 
