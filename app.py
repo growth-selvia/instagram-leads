@@ -55,7 +55,7 @@ import functools
 print = functools.partial(print, flush=True)
 
 # Variáveis de ambiente
-API_TOKEN = os.environ.get("API_TOKEN", "SELVIA_API_TOKEN_AQUI")
+API_TOKEN = os.environ.get("API_KEY", "SELVIA_API_TOKEN_AQUI")
 INSTAGRAM_USERNAME = os.environ.get("INSTAGRAM_USERNAME", "")
 INSTAGRAM_SESSION_B64 = os.environ.get("INSTAGRAM_SESSION", "")
 
