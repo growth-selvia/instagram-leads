@@ -55,7 +55,7 @@ REGEX_MEDICINA = [
 ]
 
 # Token de segurança simples (defina no .env ou variável de ambiente)
-API_TOKEN = "SELVIA_API_TOKEN_AQUI"  # ⚠️ TROQUE ISSO!
+API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"  # ⚠️ TROQUE ISSO!
 
 
 # ============================================================
