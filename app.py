@@ -1,36 +1,46 @@
 """
-Selvia — Instagram Lead Scraper API (v2 — Async + Webhook)
-===========================================================
-Versão atualizada que processa a coleta em background
-e envia os resultados via webhook para o n8n.
+Selvia — Instagram Lead Scraper API (v3 — Debug + Webhook Fix)
+===============================================================
+Versão com logs detalhados e endpoint de diagnóstico.
 
 Requisitos:
     pip install flask instaloader gunicorn requests
 
-Execução (produção):
-    gunicorn app:app --bind 0.0.0.0:5000 --workers 2 --timeout 60
+Execução:
+    gunicorn app:app --bind 0.0.0.0:5000 --workers 2 --timeout 60 --access-logfile -
 """
 
 import instaloader
 import re
 import json
+import sys
 import time
 import random
 import logging
 import threading
+import traceback
 import requests as http_requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO — Logs forçam flush para aparecer no Render
 # ============================================================
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Força logs a aparecerem imediatamente (sem buffer)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
-# Palavras-chave que indicam perfil de medicina/universitário
+# Força flush em todo print também
+import functools
+print = functools.partial(print, flush=True)
+
 KEYWORDS_MEDICINA = [
     "medicina", "med", "medica", "médica", "médico", "medico",
     "medicine", "medical", "med student", "estudante de medicina",
@@ -41,7 +51,6 @@ KEYWORDS_MEDICINA = [
     "⚕️", "🩺", "🏥", "💉", "🥼",
 ]
 
-# Padrões regex para variações como "MED 28", "MED28", "MED2028"
 REGEX_MEDICINA = [
     r"\bmed\s?\d{2,4}\b",
     r"\bmedicina\s?\d{2,4}\b",
@@ -49,8 +58,7 @@ REGEX_MEDICINA = [
     r"\b\d{2,4}\s*med\b",
 ]
 
-# Token de segurança — TROQUE ISSO!
-API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"
+API_TOKEN = "SELVIA_API_TOKEN_AQUI"  # ⚠️ TROQUE!
 
 
 # ============================================================
@@ -86,43 +94,43 @@ def get_profile_info(loader, username):
             "followers": profile.followers,
         }
     except Exception as e:
-        logger.warning(f"Não conseguiu acessar perfil @{username}: {e}")
+        logger.warning(f"Perfil @{username} inacessível: {e}")
+        sys.stdout.flush()
         return None
 
 
 def scrape_commenters(loader, target_username, max_posts=0):
     profile = instaloader.Profile.from_username(loader.context, target_username)
-
     if profile.is_private:
-        raise ValueError(f"O perfil @{target_username} é privado.")
+        raise ValueError(f"Perfil @{target_username} é privado.")
 
     commenters = {}
     posts_analyzed = 0
     total_comments = 0
 
     logger.info(f"Coletando @{target_username} ({profile.mediacount} posts)")
+    sys.stdout.flush()
 
     for post in profile.get_posts():
         if max_posts > 0 and posts_analyzed >= max_posts:
             break
-
         posts_analyzed += 1
-        logger.info(f"  Post {posts_analyzed}: {post.shortcode}")
-
         try:
             for comment in post.get_comments():
                 commenter = comment.owner.username
                 total_comments += 1
-
                 if commenter not in commenters:
                     commenters[commenter] = {"count": 0}
                 commenters[commenter]["count"] += 1
-
         except Exception as e:
             logger.warning(f"  Erro no post {post.shortcode}: {e}")
 
+        logger.info(f"  Post {posts_analyzed}/{profile.mediacount}: {post.shortcode} — {total_comments} comentários até agora")
+        sys.stdout.flush()
         time.sleep(random.uniform(3, 8))
 
+    logger.info(f"Coleta finalizada: {posts_analyzed} posts, {total_comments} comentários, {len(commenters)} únicos")
+    sys.stdout.flush()
     return {
         "commenters": commenters,
         "posts_analyzed": posts_analyzed,
@@ -132,16 +140,11 @@ def scrape_commenters(loader, target_username, max_posts=0):
 
 def enrich_and_filter_leads(loader, commenters, min_comments=1, check_bio=True):
     leads = []
-    sorted_commenters = sorted(
-        commenters.items(),
-        key=lambda x: x[1]["count"],
-        reverse=True,
-    )
+    sorted_commenters = sorted(commenters.items(), key=lambda x: x[1]["count"], reverse=True)
 
     for username, data in sorted_commenters:
         if data["count"] < min_comments:
             continue
-
         lead = {
             "username": username,
             "nome": username,
@@ -155,7 +158,6 @@ def enrich_and_filter_leads(loader, commenters, min_comments=1, check_bio=True):
             "data_envio": "",
             "coletado_em": datetime.utcnow().isoformat(),
         }
-
         if check_bio:
             info = get_profile_info(loader, username)
             if info:
@@ -165,21 +167,77 @@ def enrich_and_filter_leads(loader, commenters, min_comments=1, check_bio=True):
                 lead["followers"] = info["followers"]
                 lead["bio_match_medicina"] = bio_matches_medicina(info["bio"])
             time.sleep(random.uniform(2, 5))
-
         leads.append(lead)
 
+    logger.info(f"Leads processados: {len(leads)} total, {sum(1 for l in leads if l['bio_match_medicina'])} medicina")
+    sys.stdout.flush()
     return leads
 
 
 # ============================================================
-# PROCESSAMENTO EM BACKGROUND
+# ENVIO PARA WEBHOOK — COM RETRY E LOGS DETALHADOS
+# ============================================================
+
+def send_to_webhook(webhook_url, payload):
+    """
+    Envia o payload para o webhook do n8n.
+    Tenta até 3 vezes em caso de falha.
+    """
+    logger.info(f"[WEBHOOK] ==========================================")
+    logger.info(f"[WEBHOOK] URL: {webhook_url}")
+    logger.info(f"[WEBHOOK] Leads: {len(payload.get('leads', []))}")
+    logger.info(f"[WEBHOOK] Success: {payload.get('success')}")
+    sys.stdout.flush()
+
+    for attempt in range(1, 4):
+        try:
+            logger.info(f"[WEBHOOK] Tentativa {attempt}/3...")
+            sys.stdout.flush()
+
+            resp = http_requests.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+
+            logger.info(f"[WEBHOOK] ✅ Status: {resp.status_code}")
+            logger.info(f"[WEBHOOK] ✅ Response: {resp.text[:500]}")
+            sys.stdout.flush()
+
+            if resp.status_code == 200:
+                return True
+            else:
+                logger.warning(f"[WEBHOOK] ⚠️ Status inesperado: {resp.status_code}")
+                sys.stdout.flush()
+
+        except http_requests.exceptions.ConnectionError as e:
+            logger.error(f"[WEBHOOK] ❌ CONEXÃO FALHOU (tentativa {attempt}): {e}")
+            sys.stdout.flush()
+        except http_requests.exceptions.Timeout as e:
+            logger.error(f"[WEBHOOK] ❌ TIMEOUT (tentativa {attempt}): {e}")
+            sys.stdout.flush()
+        except Exception as e:
+            logger.error(f"[WEBHOOK] ❌ ERRO (tentativa {attempt}): {e}")
+            logger.error(f"[WEBHOOK] Traceback:\n{traceback.format_exc()}")
+            sys.stdout.flush()
+
+        if attempt < 3:
+            wait = attempt * 5
+            logger.info(f"[WEBHOOK] Aguardando {wait}s...")
+            sys.stdout.flush()
+            time.sleep(wait)
+
+    logger.error(f"[WEBHOOK] ❌❌❌ FALHA TOTAL após 3 tentativas")
+    sys.stdout.flush()
+    return False
+
+
+# ============================================================
+# JOB EM BACKGROUND
 # ============================================================
 
 def run_scrape_job(params):
-    """
-    Executa a coleta em background e envia o resultado
-    para o webhook do n8n quando terminar.
-    """
     target = params["target_username"]
     webhook_url = params["webhook_url"]
     max_posts = params.get("max_posts", 0)
@@ -187,7 +245,11 @@ def run_scrape_job(params):
     check_bio = params.get("check_bio", True)
     only_medicina = params.get("only_medicina", False)
 
-    logger.info(f"[JOB] Iniciando coleta de @{target}")
+    logger.info(f"[JOB] ========== INÍCIO DA COLETA ==========")
+    logger.info(f"[JOB] Target: @{target}")
+    logger.info(f"[JOB] Webhook: {webhook_url}")
+    logger.info(f"[JOB] Config: max_posts={max_posts}, min_comments={min_comments}, check_bio={check_bio}")
+    sys.stdout.flush()
 
     loader = instaloader.Instaloader(
         download_pictures=False,
@@ -200,27 +262,22 @@ def run_scrape_job(params):
         quiet=True,
     )
 
-    # Login opcional
     ig_login = params.get("instagram_login", "")
     ig_password = params.get("instagram_password", "")
     if ig_login and ig_password:
         try:
             loader.login(ig_login, ig_password)
+            logger.info("[JOB] Login OK")
         except Exception as e:
-            logger.warning(f"[JOB] Falha no login: {e}")
+            logger.warning(f"[JOB] Login falhou: {e}")
+        sys.stdout.flush()
 
     try:
-        # Etapa 1: Coletar comentaristas
         result = scrape_commenters(loader, target, max_posts)
-
-        # Etapa 2: Enriquecer e filtrar
-        leads = enrich_and_filter_leads(
-            loader, result["commenters"], min_comments, check_bio
-        )
+        leads = enrich_and_filter_leads(loader, result["commenters"], min_comments, check_bio)
 
         if only_medicina:
             leads = [l for l in leads if l["bio_match_medicina"]]
-
         leads.sort(key=lambda x: (-int(x["bio_match_medicina"]), -x["total_comentarios"]))
 
         stats = {
@@ -232,34 +289,25 @@ def run_scrape_job(params):
             "leads_medicina": sum(1 for l in leads if l["bio_match_medicina"]),
             "collected_at": datetime.utcnow().isoformat(),
         }
+        payload = {"success": True, "stats": stats, "leads": leads}
 
-        payload = {
-            "success": True,
-            "stats": stats,
-            "leads": leads,
-        }
-
-        logger.info(f"[JOB] Coleta concluída: {stats['leads_returned']} leads. Enviando para webhook...")
+        logger.info(f"[JOB] ✅ Coleta OK: {stats['leads_returned']} leads, {stats['leads_medicina']} medicina")
+        sys.stdout.flush()
 
     except Exception as e:
-        logger.exception(f"[JOB] Erro na coleta de @{target}")
-        payload = {
-            "success": False,
-            "error": str(e),
-            "target_username": target,
-        }
+        logger.error(f"[JOB] ❌ Erro na coleta: {e}")
+        logger.error(f"[JOB] Traceback:\n{traceback.format_exc()}")
+        sys.stdout.flush()
+        payload = {"success": False, "error": str(e), "target_username": target}
 
-    # Enviar resultado para o webhook do n8n
-    try:
-        resp = http_requests.post(
-            webhook_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        logger.info(f"[JOB] Webhook respondeu: {resp.status_code}")
-    except Exception as e:
-        logger.error(f"[JOB] Falha ao enviar para webhook: {e}")
+    # Enviar para webhook
+    success = send_to_webhook(webhook_url, payload)
+
+    if success:
+        logger.info(f"[JOB] ========== FIM — SUCESSO ==========")
+    else:
+        logger.error(f"[JOB] ========== FIM — WEBHOOK FALHOU ==========")
+    sys.stdout.flush()
 
 
 # ============================================================
@@ -268,52 +316,127 @@ def run_scrape_job(params):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "selvia-instagram-scraper", "version": "2.0"})
+    return jsonify({"status": "ok", "service": "selvia-scraper", "version": "3.0"})
+
+
+@app.route("/test-webhook", methods=["POST"])
+def test_webhook():
+    """
+    🔧 DIAGNÓSTICO: Testa se o Render consegue chamar o webhook do n8n.
+
+    Body: { "webhook_url": "https://growthselvia.app.n8n.cloud/webhook/selvia-leads" }
+
+    Envia um lead fake. Se aparecer na planilha, o webhook funciona.
+    """
+    body = request.get_json()
+    webhook_url = body.get("webhook_url", "")
+    if not webhook_url:
+        return jsonify({"error": "Campo 'webhook_url' obrigatório"}), 400
+
+    test_payload = {
+        "success": True,
+        "stats": {
+            "target_username": "TESTE_DIAGNOSTICO",
+            "posts_analyzed": 0,
+            "total_comments": 0,
+            "unique_commenters": 0,
+            "leads_returned": 1,
+            "leads_medicina": 1,
+            "collected_at": datetime.utcnow().isoformat(),
+        },
+        "leads": [
+            {
+                "username": "teste_webhook_ok",
+                "nome": "TESTE - Webhook Funcionando!",
+                "bio": "Se apareceu na planilha, o webhook funciona perfeitamente.",
+                "is_private": False,
+                "followers": 0,
+                "total_comentarios": 0,
+                "bio_match_medicina": True,
+                "status": "teste",
+                "versao_msg": "A",
+                "data_envio": "",
+                "coletado_em": datetime.utcnow().isoformat(),
+            }
+        ],
+    }
+
+    logger.info(f"[TEST-WEBHOOK] Testando: {webhook_url}")
+    sys.stdout.flush()
+
+    try:
+        resp = http_requests.post(
+            webhook_url,
+            json=test_payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        result = {
+            "webhook_url": webhook_url,
+            "status_code": resp.status_code,
+            "response_body": resp.text[:500],
+            "success": resp.status_code == 200,
+            "message": "✅ Webhook alcançável! Verifique se o lead 'teste_webhook_ok' apareceu na planilha." if resp.status_code == 200 else f"⚠️ Webhook respondeu com status {resp.status_code}",
+        }
+        logger.info(f"[TEST-WEBHOOK] Resultado: {json.dumps(result)}")
+        sys.stdout.flush()
+        return jsonify(result)
+
+    except Exception as e:
+        error_result = {
+            "webhook_url": webhook_url,
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "message": "❌ Não conseguiu alcançar o webhook. Verifique se o Fluxo 2 está ATIVO no n8n.",
+        }
+        logger.error(f"[TEST-WEBHOOK] Erro: {json.dumps(error_result)}")
+        sys.stdout.flush()
+        return jsonify(error_result), 500
 
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
     """
-    Inicia a coleta em background e retorna imediatamente.
+    Inicia coleta em background. Responde imediatamente.
 
     Body (JSON):
     {
         "target_username": "comissao_med28",
-        "webhook_url": "https://SEU-N8N.app.n8n.cloud/webhook/selvia-leads",
+        "webhook_url": "https://growthselvia.app.n8n.cloud/webhook/selvia-leads",
         "max_posts": 0,
         "min_comments": 1,
         "check_bio": true,
-        "only_medicina": false,
-        "instagram_login": "",
-        "instagram_password": ""
+        "only_medicina": false
     }
-
-    Responde imediatamente com {"status": "processing"}.
-    Quando a coleta terminar, envia o resultado para o webhook_url.
     """
     if not check_auth(request):
         return jsonify({"error": "Token inválido"}), 401
 
     body = request.get_json()
     if not body:
-        return jsonify({"error": "Body JSON é obrigatório"}), 400
+        return jsonify({"error": "Body JSON obrigatório"}), 400
     if "target_username" not in body:
-        return jsonify({"error": "Campo 'target_username' é obrigatório"}), 400
+        return jsonify({"error": "Campo 'target_username' obrigatório"}), 400
     if "webhook_url" not in body:
-        return jsonify({"error": "Campo 'webhook_url' é obrigatório"}), 400
+        return jsonify({"error": "Campo 'webhook_url' obrigatório"}), 400
 
     body["target_username"] = body["target_username"].strip().lstrip("@")
 
-    # Inicia a coleta em uma thread separada
+    logger.info(f"[API] Recebido: @{body['target_username']} → {body['webhook_url']}")
+    sys.stdout.flush()
+
     thread = threading.Thread(target=run_scrape_job, args=(body,), daemon=True)
     thread.start()
 
-    logger.info(f"Coleta de @{body['target_username']} iniciada em background")
+    logger.info(f"[API] Thread iniciada para @{body['target_username']}")
+    sys.stdout.flush()
 
     return jsonify({
         "status": "processing",
-        "message": f"Coleta de @{body['target_username']} iniciada. O resultado será enviado para {body['webhook_url']}",
+        "message": f"Coleta de @{body['target_username']} iniciada. Resultado será enviado para o webhook.",
         "target_username": body["target_username"],
+        "webhook_url": body["webhook_url"],
     })
 
 
@@ -321,25 +444,24 @@ def scrape():
 def check_profile():
     if not check_auth(request):
         return jsonify({"error": "Token inválido"}), 401
-
     body = request.get_json()
     username = body.get("username", "").strip().lstrip("@")
     if not username:
-        return jsonify({"error": "Campo 'username' é obrigatório"}), 400
+        return jsonify({"error": "Campo 'username' obrigatório"}), 400
 
     loader = instaloader.Instaloader(
         download_pictures=False, download_videos=False,
         download_video_thumbnails=False, download_geotags=False,
         download_comments=False, save_metadata=False, quiet=True,
     )
-
     info = get_profile_info(loader, username)
     if not info:
-        return jsonify({"error": f"Perfil @{username} não encontrado"}), 404
-
+        return jsonify({"error": f"@{username} não encontrado"}), 404
     info["bio_match_medicina"] = bio_matches_medicina(info["bio"])
     return jsonify({"success": True, "profile": info})
 
 
 if __name__ == "__main__":
+    print("🚀 Selvia Scraper v3 iniciando...")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
