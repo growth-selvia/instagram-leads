@@ -58,7 +58,7 @@ REGEX_MEDICINA = [
     r"\b\d{2,4}\s*med\b",
 ]
 
-API_TOKEN = "SELVIA_API_TOKEN_AQUI"  # ⚠️ TROQUE!
+API_TOKEN = "72b6834c37072a4ed459e7ba19fb1f43"  # ⚠️ TROQUE!
 
 
 # ============================================================
